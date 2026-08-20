@@ -42,6 +42,23 @@
 #define OTPC_SBPI_DONE			BIT(1)
 #define OTPC_USER_DONE			BIT(2)
 
+#define OTPC_MODE_CTRL			0x2000
+#define OTPC_IRQ_ST			0x2008
+#define OTPC_ACCESS_ADDR		0x200c
+#define OTPC_RD_DATA			0x2010
+#define OTPC_REPR_RD_TRANS_NUM		0x2020
+
+#define OTPC_DEEP_STANDBY		0x0
+#define OTPC_STANDBY			0x1
+#define OTPC_ACTIVE			0x2
+#define OTPC_READ_ACCESS		0x3
+#define OTPC_TRANS_NUM			0x1
+#define OTPC_RDM_IRQ_ST			BIT(0)
+#define OTPC_STB2ACT_IRQ_ST		BIT(7)
+#define OTPC_DP2STB_IRQ_ST		BIT(8)
+#define OTPC_ACT2STB_IRQ_ST		BIT(9)
+#define OTPC_STB2DP_IRQ_ST		BIT(10)
+
 #define SBPI_DAP_ADDR			0x02
 #define SBPI_DAP_ADDR_SHIFT		8
 #define SBPI_DAP_ADDR_MASK		GENMASK(31, 24)
@@ -65,6 +82,8 @@
 #define RK3588_ADDR_SHIFT		16
 #define RK3588_AUTO_EN			BIT(0)
 #define RK3588_RD_DONE			BIT(1)
+
+#define RK3308_GRF_CHIP_ID		((void __iomem *)(0xFF000800))
 
 struct rockchip_data {
 	int size;
@@ -184,6 +203,105 @@ read_end:
 
 	return ret;
 }
+
+static int px30s_otp_active(struct rockchip_otp *otp)
+{
+	int ret = 0;
+	u32 mode;
+
+	mode = readl(otp->base + OTPC_MODE_CTRL);
+
+	switch (mode) {
+	case OTPC_DEEP_STANDBY:
+		writel(OTPC_STANDBY, otp->base + OTPC_MODE_CTRL);
+		ret = rockchip_otp_wait_status(otp, OTPC_IRQ_ST, OTPC_DP2STB_IRQ_ST);
+		if (ret < 0) {
+			dev_err(otp->dev, "timeout during wait dp2stb\n");
+			return ret;
+		}
+		fallthrough;
+	case OTPC_STANDBY:
+		writel(OTPC_ACTIVE, otp->base + OTPC_MODE_CTRL);
+		ret = rockchip_otp_wait_status(otp, OTPC_IRQ_ST, OTPC_STB2ACT_IRQ_ST);
+		if (ret < 0) {
+			dev_err(otp->dev, "timeout during wait stb2act\n");
+			return ret;
+		}
+		break;
+	default:
+		break;
+	}
+
+	return ret;
+}
+
+static int px30s_otp_standby(struct rockchip_otp *otp)
+{
+	int ret = 0;
+	u32 mode;
+
+	mode = readl(otp->base + OTPC_MODE_CTRL);
+
+	switch (mode) {
+	case OTPC_ACTIVE:
+		writel(OTPC_STANDBY, otp->base + OTPC_MODE_CTRL);
+		ret = rockchip_otp_wait_status(otp, OTPC_IRQ_ST, OTPC_ACT2STB_IRQ_ST);
+		if (ret < 0) {
+			dev_err(otp->dev, "timeout during wait act2stb\n");
+			return ret;
+		}
+		fallthrough;
+	case OTPC_STANDBY:
+		writel(OTPC_DEEP_STANDBY, otp->base + OTPC_MODE_CTRL);
+		ret = rockchip_otp_wait_status(otp, OTPC_IRQ_ST, OTPC_STB2DP_IRQ_ST);
+		if (ret < 0) {
+			dev_err(otp->dev, "timeout during wait stb2dp\n");
+			return ret;
+		}
+		break;
+	default:
+		break;
+	}
+
+	return ret;
+}
+
+static int px30s_otp_read(void *context, unsigned int offset, void *val,
+			   size_t count)
+{
+	struct rockchip_otp *otp = context;
+	u32 *buf = val;
+	int ret;
+
+	ret = rockchip_otp_reset(otp);
+	if (ret) {
+		dev_err(otp->dev, "failed to reset otp phy\n");
+		return ret;
+	}
+
+	ret = px30s_otp_active(otp);
+	if (ret)
+		return ret;
+
+	while (count--) {
+		writel(OTPC_TRANS_NUM, otp->base + OTPC_REPR_RD_TRANS_NUM);
+		writel(offset++, otp->base + OTPC_ACCESS_ADDR);
+		writel(OTPC_READ_ACCESS, otp->base + OTPC_MODE_CTRL);
+
+		ret = rockchip_otp_wait_status(otp, OTPC_IRQ_ST, OTPC_RDM_IRQ_ST);
+		if (ret < 0) {
+			dev_err(otp->dev, "timeout during wait rd\n");
+			goto read_end;
+		}
+		*buf++ = readl(otp->base + OTPC_RD_DATA);
+	}
+
+read_end:
+	px30s_otp_standby(otp);
+
+	return ret;
+}
+
 
 static int rk3568_otp_read(void *context, unsigned int offset, void *val,
 			   size_t count)
@@ -333,6 +451,15 @@ static const struct rockchip_data px30_data = {
 	.reg_read = px30_otp_read,
 };
 
+static const struct rockchip_data px30s_data = {
+	.size = 0x80,
+	.read_offset = 0x380,
+	.word_size = sizeof(u32),
+	.clks = px30_otp_clocks,
+	.num_clks = ARRAY_SIZE(px30_otp_clocks),
+	.reg_read = px30s_otp_read,
+};
+
 static const char * const rk3528_otp_clocks[] = {
 	"otp", "apb_pclk", "sbpi",
 };
@@ -412,6 +539,28 @@ static const struct of_device_id rockchip_otp_match[] = {
 };
 MODULE_DEVICE_TABLE(of, rockchip_otp_match);
 
+static int rk3308_soc_update_data(struct device *dev,
+				  const struct rockchip_data **data)
+{
+	unsigned int chip_id;
+
+	chip_id = readl(RK3308_GRF_CHIP_ID);
+
+	switch (chip_id) {
+	/* From RK3308 TRM: "Errata: The read only chip id value is 32'h0cea(32'd3306)" */
+	case 0xcea:
+	case 0x3308:
+		break;
+	case 0x3308c:
+		*data = &px30s_data;
+		break;
+	default:
+		return dev_err_probe(dev, -EINVAL, "Unknown chip_id: 0x%x\n", chip_id);
+	}
+
+	return 0;
+}
+
 static int rockchip_otp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -428,6 +577,9 @@ static int rockchip_otp_probe(struct platform_device *pdev)
 			   GFP_KERNEL);
 	if (!otp)
 		return -ENOMEM;
+
+	if (of_machine_is_compatible("rockchip,rk3308"))
+		rk3308_soc_update_data(dev, &data);
 
 	otp->data = data;
 	otp->dev = dev;
