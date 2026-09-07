@@ -1348,6 +1348,12 @@ properties:
               - xunlong,orangepi-5b
           - const: rockchip,rk3588s
 
+      - description: Xunlong Orange Pi CM4
+        items:
+          - const: xunlong,orangepi-cm4-base
+          - const: xunlong,orangepi-cm4
+          - const: rockchip,rk3566
+
       - description: Xunlong Orange Pi CM5
         items:
           - const: xunlong,orangepi-cm5-base
